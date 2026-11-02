@@ -1,0 +1,12 @@
+build/
+dist/
+bin/
+obj/
+.vs/
+*.user
+
+# Signing material must never be committed.
+*.keystore
+*.jks
+*.idsig
+password.txt

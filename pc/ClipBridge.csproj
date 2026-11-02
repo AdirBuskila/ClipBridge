@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>ClipBridge</RootNamespace>
+    <AssemblyName>ClipBridge</AssemblyName>
+    <Version>1.2.0</Version>
+    <Product>ClipBridge</Product>
+    <Description>Copy on your Windows PC, paste on your Android device.</Description>
+    <DebugType>none</DebugType>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <DefaultItemExcludes>$(DefaultItemExcludes);Tests\**</DefaultItemExcludes>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="InTheHand.Net.Bluetooth" Version="4.*" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="App\*.cs" />
+    <Compile Include="Core\*.cs" />
+  </ItemGroup>
+</Project>
