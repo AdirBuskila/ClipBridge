@@ -1,19 +1,30 @@
 # ClipBridge
 
-**Copy on your Windows PC, paste on your Android device.** Text and screenshots, including Lightshot and anything else that copies an image.
+**Copy on your Windows PC, paste on your Android device, and the other way around.** Text and screenshots, including Lightshot and anything else that copies an image.
 
-ClipBridge exists because Samsung Flow's shared clipboard kept hanging on "connecting Wi-Fi Direct". It doesn't use Wi-Fi Direct and doesn't need an account, a cloud service, or a server. Your clips go straight from your PC to your device, encrypted.
+ClipBridge exists because Samsung Flow's shared clipboard kept hanging on "connecting Wi-Fi Direct". It doesn't use Wi-Fi Direct and doesn't need an account, a cloud service, or a server. Your clips go straight between your PC and your device, encrypted.
 
 ## Features
 
 - **Copy and paste, nothing else to do.** Press Ctrl+C on the PC and paste on the device.
+- **Send from the device too.** Tap **Send clipboard to PC** in the notification, or use the Quick Settings tile, the share menu, or the menu over selected text. Then paste on the PC.
 - **Text and images.** Hebrew and other non-English text works too.
 - **Wi-Fi or Bluetooth.** It uses Wi-Fi when it can and falls back to Bluetooth when it can't.
-- **Survives sleep and dropouts.** It reconnects by itself. The newest copy waits for up to 10 minutes and is delivered when the device is back.
+- **Survives sleep and dropouts.** It reconnects by itself. The newest copy waits for up to 10 minutes and is delivered when the other side is back.
 - **Encrypted and paired.** Only a device with your pairing code can connect.
 - **Respects password managers.** Copies marked private by the app that made them stay on the PC.
 
-It only goes one way, from PC to device.
+## Sending from the device to the PC
+
+Android doesn't let apps read the clipboard in the background, so ClipBridge can't notice a copy on the device by itself the way it does on the PC. Instead, copy as usual and then send it with one tap:
+
+- **Notification:** pull down the notification shade and tap **Send clipboard to PC** on the ClipBridge notification.
+- **Quick Settings tile:** edit your Quick Settings, add the **Send to PC** tile, and tap it after copying.
+- **Selected text:** select text in any app, open the menu that appears (tap **⋮** if needed), and choose **Send to PC**. You don't need to copy first.
+- **Share menu:** share a picture or text and choose **Send to PC**.
+- **The app:** tap **Send clipboard to PC** in ClipBridge.
+
+A "Sent to your PC" message confirms it's on the PC clipboard. Android may also show a short note that ClipBridge read your clipboard. Photos are sent as they are when the PC can read them (PNG, JPEG, GIF, BMP), and are converted to PNG otherwise.
 
 ## Setup
 
@@ -38,7 +49,9 @@ Type the 8-character code from the device into the window on the PC. If the wind
 
 ### 4. Try it
 
-When the tray icon is green, copy something on the PC and paste it on the device.
+When the tray icon is green, copy something on the PC and paste it on the device. To go the other way, copy on the device, tap **Send clipboard to PC** in the ClipBridge notification, and paste on the PC.
+
+Both apps need to be version 1.3 or newer to send from the device. An older version on either side keeps working, but only from PC to device.
 
 **To use Bluetooth,** pair the PC and the device in their normal Bluetooth settings first.
 
@@ -86,16 +99,20 @@ Some apps only accept pasted text. Use **Share image** in the ClipBridge notific
 **An old copy didn't arrive**
 Copies older than 10 minutes are dropped rather than overwriting your clipboard later. Only the newest copy is kept while disconnected.
 
+**Nothing happens when I send from the device**
+Make sure both apps are version 1.3 or newer and the tray icon is green. If the device says "Will send when your PC connects", the clip goes as soon as the PC is back, within 10 minutes. The tray menu's **Last received** line shows when the PC last got something.
+
 ## Security and privacy
 
 - Clips travel directly between your devices and nothing is sent to any server.
 - Both sides prove they know the pairing code before anything is sent, and everything after that is encrypted with AES-256-GCM using keys unique to each connection.
 - The code is run through PBKDF2 (300,000 rounds) to slow down guessing. The PC stores it encrypted for your Windows user with DPAPI.
-- Recent screenshots, up to three, stay in the Android app's private cache until replaced.
+- Recent screenshots from the PC, up to three, stay in the Android app's private cache until replaced.
 
 **Please keep in mind:**
 - This is a hobby project and **hasn't had an independent security audit**. The cryptography uses standard, well-known building blocks, but they've been combined specifically for this app.
 - Anything you copy on the PC is sent to the device unless the app that copied it marks it private. Many password managers do, but check yours, or use **Pause** in the tray menu.
+- Nothing on the device is sent unless you send it. Whatever you do send replaces the PC's clipboard.
 - An 8-character code is convenient rather than unbreakable. If you think it has leaked, get a new one by clearing the app's data in Android's app settings, then enter the new code on the PC.
 
 ## What's been tested
@@ -141,7 +158,7 @@ dist\ClipBridge.exe --test-bluetooth
 | `pc/Tests` | Automated tests |
 | `android/src` | Android app. `Protocol.java` and `BridgeServer.java` have no Android dependencies, so the tests can run them on a PC. |
 
-The device listens and the PC connects to it. Android has no inbound firewall, while Windows blocks inbound connections on networks marked Public, so this avoids any firewall setup. It uses TCP port 47821 and UDP port 47822 on Wi-Fi.
+The device listens and the PC connects to it. Clips then travel both ways over that one connection. The device only sends its own clips once the PC's pings show that it can read them, so an older PC is never sent one. Android has no inbound firewall, while Windows blocks inbound connections on networks marked Public, so this avoids any firewall setup. It uses TCP port 47821 and UDP port 47822 on Wi-Fi.
 
 ## License
 

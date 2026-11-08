@@ -20,7 +20,9 @@ import java.util.Arrays;
 
 /**
  * Listens for the PC. The tablet is the listener because Android has no inbound
- * firewall, while Windows blocks inbound traffic on "Public" networks.
+ * firewall, while Windows blocks inbound traffic on "Public" networks. Once connected,
+ * clips go both ways over the same connection: the tablet sends its own only after the
+ * PC's pings show it can read them, so an older PC is never sent one.
  *
  * No Android imports: the interop tests run this class on a desktop JVM. Bluetooth
  * connections are accepted by BridgeService and handed to handleConnection.
@@ -32,12 +34,17 @@ public final class BridgeServer {
 
         void onConnectionChanged(boolean connected, String peer);
 
+        /** The PC confirmed a clip from sendToPc landed on its clipboard. */
+        void onSentToPc(long id);
+
         void onLog(String message);
     }
 
     private static final int HANDSHAKE_TIMEOUT_MS = 10000;
     /** PC pings every 20s; a little over two missed pings means the link is dead. */
     private static final int IDLE_TIMEOUT_MS = 50000;
+    /** Same limit the PC uses: don't overwrite its clipboard with something copied long ago. */
+    private static final long MAX_CLIP_AGE_MS = 10 * 60 * 1000;
 
     private final byte[] key;
     private final int tcpPort;
@@ -52,6 +59,24 @@ public final class BridgeServer {
     private final Object activeLock = new Object();
     private long lastClipId = Long.MIN_VALUE;
 
+    /** The newest clip for the PC, kept until the PC confirms it. */
+    private Outgoing outgoing;
+    private long lastOutId;
+    private final Object outLock = new Object();
+
+    private static final class Outgoing {
+        final byte type;
+        final long id;
+        final byte[] payload;
+        final long created = System.currentTimeMillis();
+
+        Outgoing(byte type, long id, byte[] payload) {
+            this.type = type;
+            this.id = id;
+            this.payload = payload;
+        }
+    }
+
     public BridgeServer(byte[] key, int tcpPort, int udpPort, Listener listener) {
         this.key = key;
         this.tcpPort = tcpPort;
@@ -63,6 +88,27 @@ public final class BridgeServer {
         running = true;
         new Thread(this::acceptLoop, "cb-accept").start();
         new Thread(this::discoveryLoop, "cb-discovery").start();
+    }
+
+    /**
+     * Queues a clip for the PC. A newer clip replaces one not yet delivered. It goes out
+     * as soon as a PC that reads clips is connected, or when one next connects.
+     */
+    public long sendToPc(byte type, byte[] payload) {
+        synchronized (outLock) {
+            long id = Math.max(System.currentTimeMillis(), lastOutId + 1);
+            lastOutId = id;
+            outgoing = new Outgoing(type, id, payload);
+            outLock.notifyAll();
+            return id;
+        }
+    }
+
+    /** True while a clip for the PC is waiting. */
+    public boolean hasPendingForPc() {
+        synchronized (outLock) {
+            return outgoing != null;
+        }
     }
 
     public void stop() {
@@ -149,6 +195,7 @@ public final class BridgeServer {
     public void handleConnection(InputStream in, OutputStream out, Closeable connection, String peer) {
         Watchdog watchdog = new Watchdog(connection);
         boolean authenticated = false;
+        Session session = null;
         try {
             watchdog.start();
             InputStream rawIn = new BufferedInputStream(new WatchedInput(in, watchdog));
@@ -166,10 +213,12 @@ public final class BridgeServer {
             }
             watchdog.authenticated();
             listener.onConnectionChanged(true, peer);
-            serve(ch);
+            session = new Session(this, ch, connection, "Bluetooth".equals(peer));
+            serve(session);
         } catch (IOException e) {
             listener.onLog("connection ended (" + peer + "): " + e.getMessage());
         } finally {
+            if (session != null) session.end();
             watchdog.finish();
             closeQuietly(connection);
             if (authenticated) {
@@ -203,7 +252,8 @@ public final class BridgeServer {
         return new Protocol.Channel(rawIn, rawOut, t2c, c2t);
     }
 
-    private void serve(Protocol.Channel ch) throws IOException {
+    private void serve(Session session) throws IOException {
+        Protocol.Channel ch = session.ch;
         while (running) {
             byte[] frame = ch.receive();
             if (frame.length < 9) throw new IOException("short frame");
@@ -223,10 +273,136 @@ public final class BridgeServer {
                         lastClipId = id;
                     }
                 }
-            } else if (type != Protocol.TYPE_PING) {
+            } else if (type == Protocol.TYPE_PING) {
+                if (endsWith(frame, Protocol.DUPLEX_MARKER)) session.startSending();
+            } else if (type == Protocol.TYPE_ACK) {
+                // The PC confirming a clip this tablet sent. Acks are never acked.
+                session.acked(id);
+                continue;
+            } else {
                 throw new IOException("unknown frame type " + type);
             }
             ch.send(ByteBuffer.allocate(9).put(Protocol.TYPE_ACK).putLong(id).array());
+        }
+    }
+
+    private static boolean endsWith(byte[] frame, byte[] suffix) {
+        if (frame.length < 9 + suffix.length) return false;
+        return Arrays.equals(Arrays.copyOfRange(frame, frame.length - suffix.length, frame.length), suffix);
+    }
+
+    /** Takes the clip for the PC, waiting up to waitMs for one. Drops one that has grown too old. */
+    private Outgoing nextOutgoing(long waitMs) throws InterruptedException {
+        synchronized (outLock) {
+            if (outgoing == null) outLock.wait(waitMs);
+            if (outgoing != null && System.currentTimeMillis() - outgoing.created > MAX_CLIP_AGE_MS) {
+                listener.onLog("dropped clip " + outgoing.id + " for the PC: older than 10 minutes");
+                outgoing = null;
+            }
+            return outgoing;
+        }
+    }
+
+    private void delivered(Outgoing clip) {
+        synchronized (outLock) {
+            if (outgoing == clip) outgoing = null;
+        }
+        listener.onLog("delivered clip " + clip.id + " to the PC (" + clip.payload.length + " bytes)");
+        listener.onSentToPc(clip.id);
+    }
+
+    /**
+     * One authenticated connection. Its thread sends this tablet's clips over it, once
+     * the PC shows it can read them. Static, like Watchdog: d8 34.0.0 crashes compiling
+     * threads declared inside a non-static inner class.
+     */
+    private static final class Session extends Thread {
+        final BridgeServer server;
+        final Protocol.Channel ch;
+        final Closeable connection;
+        final boolean slow;
+        private final Object ackLock = new Object();
+        private long lastAck = Long.MIN_VALUE;
+        private volatile boolean ended;
+        private boolean sending;
+
+        Session(BridgeServer server, Protocol.Channel ch, Closeable connection, boolean slow) {
+            super("cb-send");
+            setDaemon(true);
+            this.server = server;
+            this.ch = ch;
+            this.connection = connection;
+            this.slow = slow;
+        }
+
+        synchronized void startSending() {
+            if (sending || ended) return;
+            sending = true;
+            start();
+        }
+
+        void acked(long id) {
+            synchronized (ackLock) {
+                lastAck = id;
+                ackLock.notifyAll();
+            }
+        }
+
+        void end() {
+            synchronized (ackLock) {
+                ended = true;
+                ackLock.notifyAll();
+            }
+            synchronized (this) {
+                if (sending) interrupt();
+            }
+        }
+
+        private boolean isEnded() {
+            synchronized (ackLock) {
+                return ended;
+            }
+        }
+
+        @Override
+        public void run() {
+            try {
+                while (!isEnded()) {
+                    Outgoing clip = server.nextOutgoing(1000);
+                    if (clip == null) continue;
+                    byte[] frame = ByteBuffer.allocate(9 + clip.payload.length)
+                            .put(clip.type).putLong(clip.id).put(clip.payload).array();
+                    ch.send(frame);
+                    // Same allowances as the PC, plus time for the PC to set its clipboard.
+                    long timeout = (slow ? 20_000 + clip.payload.length / 15 : 8000 + clip.payload.length / 256) + 5000;
+                    if (!waitForAck(clip.id, timeout)) {
+                        if (!isEnded()) {
+                            server.listener.onLog("PC did not confirm clip " + clip.id + ", reconnecting");
+                            closeQuietly(connection);
+                        }
+                        return;
+                    }
+                    server.delivered(clip);
+                }
+            } catch (InterruptedException ignored) {
+                // The connection ended.
+            } catch (IOException e) {
+                server.listener.onLog("sending to the PC failed: " + e.getMessage());
+                closeQuietly(connection);
+            }
+        }
+
+        private boolean waitForAck(long id, long timeoutMs) throws InterruptedException {
+            long deadline = System.currentTimeMillis() + timeoutMs;
+            synchronized (ackLock) {
+                while (lastAck != id) {
+                    if (ended) return false;
+                    long left = deadline - System.currentTimeMillis();
+                    if (left <= 0) return false;
+                    ackLock.wait(left);
+                }
+                return true;
+            }
         }
     }
 

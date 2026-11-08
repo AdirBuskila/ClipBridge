@@ -24,6 +24,7 @@ import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.util.Log;
+import android.widget.Toast;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -43,7 +44,11 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
-/** Stays running in the background and puts whatever the PC sends on the clipboard. */
+/**
+ * Stays running in the background, puts whatever the PC sends on the clipboard, and
+ * sends the PC what SendActivity hands it. Android lets only the focused app read the
+ * clipboard, so sending is started from an activity rather than by watching for copies.
+ */
 public class BridgeService extends Service implements BridgeServer.Listener {
     private static final String TAG = "ClipBridge";
     private static final String CHANNEL = "status";
@@ -56,6 +61,16 @@ public class BridgeService extends Service implements BridgeServer.Listener {
     static volatile boolean connected;
     static volatile String connectedVia = "";
     static volatile String lastClip = "Nothing received yet";
+    static volatile String lastSent = "Nothing sent yet";
+    static volatile String lastActivity = "Nothing received yet";
+
+    /** The running service, so SendActivity can hand it a clip. */
+    private static volatile BridgeService instance;
+    /** A clip handed over before the service was up. Guarded by BridgeService.class. */
+    private static byte queuedType;
+    private static byte[] queuedPayload;
+    private static String queuedLabel;
+    private volatile String sendingLabel = "";
     static volatile String bluetoothState = "Bluetooth: starting";
 
     private volatile boolean stopping;
@@ -115,6 +130,14 @@ public class BridgeService extends Service implements BridgeServer.Listener {
 
         server = new BridgeServer(Protocol.deriveKey(pairingCode(this)), Protocol.TCP_PORT, Protocol.UDP_PORT, this);
         server.start();
+        synchronized (BridgeService.class) {
+            if (queuedPayload != null) {
+                sendingLabel = queuedLabel;
+                server.sendToPc(queuedType, queuedPayload);
+                queuedPayload = null;
+            }
+            instance = this;
+        }
         new Thread(this::bluetoothLoop, "cb-bluetooth").start();
     }
 
@@ -181,8 +204,37 @@ public class BridgeService extends Service implements BridgeServer.Listener {
         return START_STICKY;
     }
 
+    /**
+     * Sends a clip to the PC, now if it's connected or else once it connects. Returns
+     * what to tell the user.
+     */
+    static String sendToPc(Context context, byte type, byte[] payload, String what) {
+        BridgeService service;
+        synchronized (BridgeService.class) {
+            service = instance;
+            if (service != null) {
+                service.sendingLabel = what;
+                service.server.sendToPc(type, payload);
+            } else {
+                queuedType = type;
+                queuedPayload = payload;
+                queuedLabel = what;
+            }
+        }
+        lastSent = what + ", waiting for your PC";
+        if (service != null) {
+            service.updateNotification();
+        } else {
+            context.startForegroundService(new Intent(context, BridgeService.class));
+        }
+        return connected ? "Sending to your PC" : "Will send when your PC connects";
+    }
+
     @Override
     public void onDestroy() {
+        synchronized (BridgeService.class) {
+            if (instance == this) instance = null;
+        }
         stopping = true;
         BluetoothServerSocket listen = bluetoothListener;
         if (listen != null) {
@@ -214,6 +266,7 @@ public class BridgeService extends Service implements BridgeServer.Listener {
                 clip = ClipData.newPlainText("ClipBridge", new String(payload, StandardCharsets.UTF_8));
                 lastImage = null;
                 lastClip = "Text, " + payload.length + " bytes";
+                lastActivity = "Received text, " + payload.length + " bytes";
             } else if (type == Protocol.TYPE_PNG) {
                 File file = new File(ClipProvider.clipDir(this), Long.toUnsignedString(id) + ".png");
                 try (FileOutputStream out = new FileOutputStream(file)) {
@@ -223,6 +276,7 @@ public class BridgeService extends Service implements BridgeServer.Listener {
                 clip = ClipData.newUri(getContentResolver(), "Screenshot", uri);
                 lastImage = uri;
                 lastClip = "Screenshot, " + (payload.length / 1024) + " KB";
+                lastActivity = "Received screenshot, " + (payload.length / 1024) + " KB";
                 pruneImages();
             } else {
                 throw new IllegalArgumentException("unknown clip type " + type);
@@ -266,6 +320,15 @@ public class BridgeService extends Service implements BridgeServer.Listener {
     }
 
     @Override
+    public void onSentToPc(long id) {
+        String what = sendingLabel;
+        lastSent = what;
+        lastActivity = "Sent to PC: " + what;
+        updateNotification();
+        main.post(() -> Toast.makeText(this, "Sent to your PC", Toast.LENGTH_SHORT).show());
+    }
+
+    @Override
     public void onLog(String message) {
         Log.i(TAG, message);
     }
@@ -280,10 +343,16 @@ public class BridgeService extends Service implements BridgeServer.Listener {
         Notification.Builder b = new Notification.Builder(this, CHANNEL)
                 .setSmallIcon(R.drawable.ic_app)
                 .setContentTitle(connected ? "Connected to your PC" + connectedVia : "Waiting for your PC")
-                .setContentText(lastClip)
+                .setContentText(lastActivity)
                 .setContentIntent(open)
                 .setOnlyAlertOnce(true)
                 .setOngoing(true);
+        // Android only lets the focused app read the clipboard, so this opens an
+        // invisible activity that reads it, sends it and closes.
+        PendingIntent sendClipboard = PendingIntent.getActivity(this, 2,
+                new Intent(this, SendActivity.class).setAction(SendActivity.ACTION_SEND_CLIPBOARD),
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+        b.addAction(new Notification.Action.Builder(null, "Send clipboard to PC", sendClipboard).build());
         Uri image = lastImage;
         if (image != null) {
             // For apps that refuse pasted images.

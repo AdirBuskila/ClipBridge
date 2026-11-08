@@ -18,6 +18,12 @@ public static class Proto
 
     public const int MaxFrame = 128 * 1024 * 1024;
 
+    /// <summary>
+    /// Appended to every ping. Tells the tablet this PC reads clips the tablet sends, so
+    /// a tablet never sends one to an older PC that would treat it as an error.
+    /// </summary>
+    public static readonly byte[] DuplexMarker = Encoding.ASCII.GetBytes("CB-DUPLEX");
+
     internal static readonly byte[] Hello = Encoding.ASCII.GetBytes("CB1\n");
     internal static readonly byte[] DiscoverMagic = Encoding.ASCII.GetBytes("CBD1");
     internal static readonly byte[] ReplyMagic = Encoding.ASCII.GetBytes("CBR1");
@@ -80,6 +86,7 @@ public sealed class SecureChannel : IDisposable
     private readonly Stream _stream;
     private readonly AesGcm _send;
     private readonly AesGcm _recv;
+    private readonly object _sendLock = new();
     private ulong _sendCounter;
     private ulong _recvCounter;
 
@@ -150,6 +157,16 @@ public sealed class SecureChannel : IDisposable
 
     public void SetTimeout(int ms) => ApplyTimeout(_stream, ms);
 
+    public void SetReadTimeout(int ms)
+    {
+        if (_stream.CanTimeout) _stream.ReadTimeout = ms;
+    }
+
+    public void SetWriteTimeout(int ms)
+    {
+        if (_stream.CanTimeout) _stream.WriteTimeout = ms;
+    }
+
     private static byte[] Nonce(ulong counter)
     {
         var n = new byte[12];
@@ -157,14 +174,18 @@ public sealed class SecureChannel : IDisposable
         return n;
     }
 
+    /// <summary>Safe to call from several threads. Only one thread may call Receive.</summary>
     public void Send(byte[] plain)
     {
         var buf = new byte[4 + plain.Length + 16];
         BinaryPrimitives.WriteInt32BigEndian(buf, plain.Length + 16);
-        _send.Encrypt(Nonce(_sendCounter++), plain,
-            buf.AsSpan(4, plain.Length), buf.AsSpan(4 + plain.Length, 16));
-        _stream.Write(buf);
-        _stream.Flush();
+        lock (_sendLock)
+        {
+            _send.Encrypt(Nonce(_sendCounter++), plain,
+                buf.AsSpan(4, plain.Length), buf.AsSpan(4 + plain.Length, 16));
+            _stream.Write(buf);
+            _stream.Flush();
+        }
     }
 
     public byte[] Receive()

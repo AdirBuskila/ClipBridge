@@ -31,6 +31,8 @@ TabletLink NewLink() => new()
     ExtraDiscoveryTargets = [new IPEndPoint(IPAddress.Loopback, Udp)],
 };
 
+static string Sha(byte[] b) => Convert.ToHexString(SHA256.HashData(b)).ToLowerInvariant();
+
 static bool WaitFor(Func<bool> cond, int ms)
 {
     var sw = Stopwatch.StartNew();
@@ -183,6 +185,88 @@ using (var tablet = new FakeTablet(classes, Code, Tcp, Udp))
         Proto.DeriveKey("abcd efgh").SequenceEqual(Proto.DeriveKey(Code)));
 }
 
+// --- Tablet to PC
+using (var tablet = new FakeTablet(classes, Code, Tcp, Udp))
+{
+    // An older PC never marks its pings, so it must never be sent a clip it can't read.
+    var early = Encoding.UTF8.GetBytes("copied on the tablet before a new PC connected");
+    tablet.SendToPc("out-0.txt", early);
+    Check("tablet queues a clip for the PC", WaitFor(() => tablet.Queued("out-0.txt") != null, 3000));
+    using (var old = SecureChannel.Connect("127.0.0.1", Tcp, Proto.DeriveKey(Code), 3000))
+    {
+        bool onlyAcks = true;
+        for (int i = 0; i < 3; i++)
+        {
+            long pingId = 1000 + i;
+            var ping = new byte[9];
+            ping[0] = Proto.TypePing;
+            System.Buffers.Binary.BinaryPrimitives.WriteInt64BigEndian(ping.AsSpan(1), pingId);
+            old.Send(ping);
+            var reply = old.Receive();
+            onlyAcks &= reply.Length == 9 && reply[0] == Proto.TypeAck &&
+                System.Buffers.Binary.BinaryPrimitives.ReadInt64BigEndian(reply.AsSpan(1)) == pingId;
+            Thread.Sleep(300);
+        }
+        Check("an older PC is never sent a tablet clip", onlyAcks);
+    }
+
+    var received = new ConcurrentQueue<(byte Type, string Sha)>();
+    var states = new ConcurrentQueue<LinkState>();
+    var delivered = new ConcurrentQueue<long>();
+    var link = NewLink();
+    try
+    {
+        link.ClipReceived += (t, p) => received.Enqueue((t, Sha(p)));
+        link.StateChanged += (st, _) => states.Enqueue(st);
+        link.ClipDelivered += delivered.Enqueue;
+        link.Configure(Code, null, null);
+        link.Start();
+        Check("clip queued before the PC connected arrives", WaitFor(() => received.Contains((Proto.TypeText, Sha(early))), 5000));
+        Check("tablet is told the PC got it", WaitFor(() => tablet.Sent("out-0.txt"), 3000));
+
+        var text = Encoding.UTF8.GetBytes("from the tablet שלום 🎉");
+        tablet.SendToPc("out-1.txt", text);
+        Check("tablet text reaches the PC byte-for-byte", WaitFor(() => received.Contains((Proto.TypeText, Sha(text))), 3000));
+
+        var img = RandomNumberGenerator.GetBytes(5 * 1024 * 1024);
+        tablet.SendToPc("out-2.png", img);
+        Check("5 MB tablet image reaches the PC intact", WaitFor(() => received.Contains((Proto.TypePng, Sha(img))), 10000));
+
+        // Large clips crossing in both directions at once must not jam the connection.
+        var toTablet = RandomNumberGenerator.GetBytes(20 * 1024 * 1024);
+        var toPc = RandomNumberGenerator.GetBytes(10 * 1024 * 1024);
+        long toTabletId = link.Send(Proto.TypePng, toTablet);
+        tablet.SendToPc("out-3.png", toPc);
+        Check("PC to tablet while tablet sends to PC", WaitFor(() => delivered.Contains(toTabletId), 20000) && tablet.HasClip(Proto.TypePng, toTabletId, toTablet));
+        Check("tablet to PC while PC sends to tablet", WaitFor(() => received.Contains((Proto.TypePng, Sha(toPc))), 20000));
+
+        int count = received.Count;
+        int drops = tablet.Lines.Count(l => l == "DISCONNECTED");
+        Thread.Sleep(1600);
+        Check("each tablet clip arrives once, connection stays up",
+            received.Count == count && count == 4 && tablet.Lines.Count(l => l == "DISCONNECTED") == drops && states.Last() == LinkState.Connected,
+            $"received={received.Count} drops={drops}->{tablet.Lines.Count(l => l == "DISCONNECTED")} state={states.Last()}");
+    }
+    finally
+    {
+        link.Dispose();
+    }
+
+    // Copied on the tablet while the PC is away: delivered when the PC comes back.
+    var offline = Encoding.UTF8.GetBytes("copied while the PC was away");
+    tablet.SendToPc("out-4.txt", offline);
+    WaitFor(() => tablet.Queued("out-4.txt") != null, 3000);
+    Thread.Sleep(500);
+    var later = new ConcurrentQueue<string>();
+    using (var link2 = NewLink())
+    {
+        link2.ClipReceived += (_, p) => later.Enqueue(Sha(p));
+        link2.Configure(Code, null, null);
+        link2.Start();
+        Check("tablet clip waits for the PC to come back", WaitFor(() => later.Contains(Sha(offline)), 6000));
+    }
+}
+
 // --- An existing 16-character pairing keeps working after the update
 using (var oldTablet = new FakeTablet(classes, "ABCD-EFGH-JKMN-PQRS", Tcp, Udp))
 {
@@ -237,7 +321,27 @@ sealed class FakeTablet : IDisposable
     private readonly string _classes, _code;
     private readonly int _tcp, _udp;
     private Process? _p;
+    private readonly string _outbox = Path.Combine(Path.GetTempPath(), "cb-outbox-" + Guid.NewGuid().ToString("N"));
     public ConcurrentQueue<string> Lines { get; } = new();
+
+    /// <summary>Makes the tablet send a clip to the PC, as if copied there. Name it out-*.txt or out-*.png.</summary>
+    public void SendToPc(string name, byte[] payload)
+    {
+        var tmp = Path.Combine(_outbox, name + ".tmp");
+        File.WriteAllBytes(tmp, payload);
+        File.Move(tmp, Path.Combine(_outbox, name));
+    }
+
+    /// <summary>The id the tablet gave a clip from SendToPc, once queued.</summary>
+    public string? Queued(string name) =>
+        Lines.FirstOrDefault(l => l.StartsWith($"QUEUED {name} "))?.Split(' ')[2];
+
+    /// <summary>True once the PC confirmed the clip landed on its clipboard.</summary>
+    public bool Sent(string name)
+    {
+        var id = Queued(name);
+        return id != null && Lines.Contains("SENT " + id);
+    }
 
     public FakeTablet(string classes, string code, int tcp, int udp)
     {
@@ -261,6 +365,8 @@ sealed class FakeTablet : IDisposable
             RedirectStandardError = true,
             UseShellExecute = false,
         };
+        Directory.CreateDirectory(_outbox);
+        psi.Environment["CB_OUTBOX_DIR"] = _outbox;
         foreach (var a in new[] { "-cp", _classes, "InteropServer", _code, _tcp.ToString(), _udp.ToString() })
             psi.ArgumentList.Add(a);
         var ready = new ManualResetEventSlim();
@@ -285,5 +391,9 @@ sealed class FakeTablet : IDisposable
         _p = null;
     }
 
-    public void Dispose() => Kill();
+    public void Dispose()
+    {
+        Kill();
+        try { Directory.Delete(_outbox, true); } catch { }
+    }
 }

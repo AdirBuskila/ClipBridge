@@ -15,7 +15,8 @@ public enum LinkState
 /// <summary>
 /// Keeps a connection to the tablet and delivers the latest clip. A clip stays
 /// pending until the tablet confirms it landed on the clipboard, so a sleeping
-/// tablet or a Wi-Fi drop delays delivery instead of losing it.
+/// tablet or a Wi-Fi drop delays delivery instead of losing it. Clips the tablet
+/// sends come in on the same connection and raise ClipReceived.
 /// </summary>
 public sealed class TabletLink : IDisposable
 {
@@ -38,6 +39,13 @@ public sealed class TabletLink : IDisposable
 
     public event Action<LinkState, string?>? StateChanged;
     public event Action<long>? ClipDelivered;
+
+    /// <summary>
+    /// A clip from the tablet. Runs on the connection's reader thread and must return
+    /// only once the clip is on the clipboard: the tablet is acknowledged afterwards, and
+    /// throwing leaves it unacknowledged so the tablet sends it again.
+    /// </summary>
+    public event Action<byte, byte[]>? ClipReceived;
     public event Action<string>? Log;
 
     /// <summary>Called with the address whenever a connection succeeds, so it can be remembered.</summary>
@@ -54,6 +62,7 @@ public sealed class TabletLink : IDisposable
     private bool _paused;
     private Clip? _pending;
     private long _lastId;
+    private long _lastReceivedId = long.MinValue;
     private volatile bool _stop;
     private Thread? _thread;
     private LinkState _state = (LinkState)(-1);
@@ -226,9 +235,19 @@ public sealed class TabletLink : IDisposable
 
     private void Session(SecureChannel ch, int generation)
     {
+        // The reader always has something to read within a ping interval (the ping's ack),
+        // so a long silence means the link is dead even if the main loop is idle.
+        ch.SetReadTimeout(PingIntervalMs * 2 + (ch.IsSlowLink ? 60_000 : 30_000));
+        var acks = new AckBox();
+        var reader = new Thread(() => ReadLoop(ch, acks)) { IsBackground = true, Name = "tablet-reader" };
+        reader.Start();
+
+        // Ping straight away so the tablet learns at once that it may send clips.
+        Ping(ch, acks);
         long nextPing = Environment.TickCount64 + PingIntervalMs;
         while (!_stop && generation == CurrentGeneration())
         {
+            acks.ThrowIfFailed();
             var clip = TakePending();
             if (clip != null)
             {
@@ -239,11 +258,12 @@ public sealed class TabletLink : IDisposable
 
                 // Allow for slow Wi-Fi (8s plus 256 KB/s) or Bluetooth (20s plus 15 KB/s,
                 // about half the speed measured on a real link).
-                ch.SetTimeout(ch.IsSlowLink
+                int timeout = ch.IsSlowLink
                     ? 20_000 + clip.Payload.Length / 15
-                    : 8000 + clip.Payload.Length / 256);
+                    : 8000 + clip.Payload.Length / 256;
+                ch.SetWriteTimeout(timeout);
                 ch.Send(frame);
-                WaitForAck(ch, clip.Id);
+                acks.Wait(clip.Id, timeout);
                 ClearPending(clip);
                 Log?.Invoke($"delivered clip {clip.Id} ({clip.Payload.Length} bytes)");
                 ClipDelivered?.Invoke(clip.Id);
@@ -254,13 +274,7 @@ public sealed class TabletLink : IDisposable
             long now = Environment.TickCount64;
             if (now >= nextPing)
             {
-                long pingId = now;
-                var frame = new byte[9];
-                frame[0] = Proto.TypePing;
-                BinaryPrimitives.WriteInt64BigEndian(frame.AsSpan(1), pingId);
-                ch.SetTimeout(ch.IsSlowLink ? 20_000 : 10_000);
-                ch.Send(frame);
-                WaitForAck(ch, pingId);
+                Ping(ch, acks);
                 nextPing = Environment.TickCount64 + PingIntervalMs;
                 continue;
             }
@@ -269,14 +283,123 @@ public sealed class TabletLink : IDisposable
         }
     }
 
-    private static void WaitForAck(SecureChannel ch, long id)
+    private static void Ping(SecureChannel ch, AckBox acks)
     {
-        while (true)
+        long pingId = Environment.TickCount64;
+        var frame = new byte[9 + Proto.DuplexMarker.Length];
+        frame[0] = Proto.TypePing;
+        BinaryPrimitives.WriteInt64BigEndian(frame.AsSpan(1), pingId);
+        Proto.DuplexMarker.CopyTo(frame, 9);
+        int timeout = ch.IsSlowLink ? 20_000 : 10_000;
+        ch.SetWriteTimeout(timeout);
+        ch.Send(frame);
+        acks.Wait(pingId, timeout);
+    }
+
+    /// <summary>Reads everything the tablet sends: acks for our frames, and its own clips.</summary>
+    private void ReadLoop(SecureChannel ch, AckBox acks)
+    {
+        try
         {
-            var reply = ch.Receive();
-            if (reply.Length != 9 || reply[0] != Proto.TypeAck)
-                throw new IOException("unexpected reply from tablet");
-            if (BinaryPrimitives.ReadInt64BigEndian(reply.AsSpan(1)) == id) return;
+            while (true)
+            {
+                var frame = ch.Receive();
+                if (frame.Length < 9) throw new IOException("short frame from tablet");
+                byte type = frame[0];
+                long id = BinaryPrimitives.ReadInt64BigEndian(frame.AsSpan(1));
+                if (type == Proto.TypeAck)
+                {
+                    acks.Ack(id);
+                }
+                else if (type is Proto.TypeText or Proto.TypePng)
+                {
+                    // A retry of a clip that already landed (its ack got lost) is only re-acked.
+                    if (id != _lastReceivedId)
+                    {
+                        var payload = frame.AsSpan(9).ToArray();
+                        try
+                        {
+                            ClipReceived?.Invoke(type, payload);
+                        }
+                        catch (Exception e)
+                        {
+                            throw new IOException("could not apply clip from tablet: " + e.GetBaseException().Message, e);
+                        }
+                        _lastReceivedId = id;
+                        Log?.Invoke($"received clip {id} from tablet ({payload.Length} bytes)");
+                    }
+                    var ack = new byte[9];
+                    ack[0] = Proto.TypeAck;
+                    BinaryPrimitives.WriteInt64BigEndian(ack.AsSpan(1), id);
+                    ch.Send(ack);
+                }
+                else
+                {
+                    throw new IOException($"unknown frame type {type} from tablet");
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            acks.Fail(e);
+            // Wake the main loop so it notices at once. After Dispose there is nothing to wake.
+            try
+            {
+                if (!_stop) _wake.Set();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
+    }
+
+    /// <summary>Hands acks from the reader thread to the thread waiting for them.</summary>
+    private sealed class AckBox
+    {
+        private readonly object _gate = new();
+        private long _last = long.MinValue;
+        private Exception? _error;
+
+        public void Ack(long id)
+        {
+            lock (_gate)
+            {
+                _last = id;
+                Monitor.PulseAll(_gate);
+            }
+        }
+
+        public void Fail(Exception e)
+        {
+            lock (_gate)
+            {
+                _error ??= e;
+                Monitor.PulseAll(_gate);
+            }
+        }
+
+        public void ThrowIfFailed()
+        {
+            lock (_gate)
+            {
+                if (_error != null) throw new IOException(_error.GetBaseException().Message, _error);
+            }
+        }
+
+        /// <summary>Frames are acked in order and only one waits at a time, so the last ack is enough.</summary>
+        public void Wait(long id, int timeoutMs)
+        {
+            long deadline = Environment.TickCount64 + timeoutMs;
+            lock (_gate)
+            {
+                while (_last != id)
+                {
+                    if (_error != null) throw new IOException(_error.GetBaseException().Message, _error);
+                    long left = deadline - Environment.TickCount64;
+                    if (left <= 0) throw new TimeoutException("tablet did not acknowledge in time");
+                    Monitor.Wait(_gate, (int)Math.Min(left, int.MaxValue));
+                }
+            }
         }
     }
 

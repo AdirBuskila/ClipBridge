@@ -57,7 +57,7 @@ internal static class Program
     }
 }
 
-/// <summary>Tray icon and menu. Green means your copies reach the tablet.</summary>
+/// <summary>Tray icon and menu. Green means copies go both ways between PC and tablet.</summary>
 internal sealed class TrayApp : IDisposable
 {
     private readonly Settings _settings = Settings.Load();
@@ -67,6 +67,7 @@ internal sealed class TrayApp : IDisposable
     private readonly SynchronizationContext _ui = SynchronizationContext.Current!;
     private readonly ToolStripMenuItem _status = new("Starting...") { Enabled = false };
     private readonly ToolStripMenuItem _last = new("Nothing sent yet") { Enabled = false };
+    private readonly ToolStripMenuItem _received = new("Nothing received yet") { Enabled = false };
     private readonly ToolStripMenuItem _pause = new("Pause");
     private readonly ToolStripMenuItem _autostart = new("Start with Windows");
     private readonly Dictionary<Color, Icon> _icons = new();
@@ -86,6 +87,7 @@ internal sealed class TrayApp : IDisposable
         var menu = new ContextMenuStrip();
         menu.Items.Add(_status);
         menu.Items.Add(_last);
+        menu.Items.Add(_received);
         menu.Items.Add(new ToolStripSeparator());
         _pause.CheckOnClick = true;
         _pause.CheckedChanged += (_, _) =>
@@ -119,6 +121,13 @@ internal sealed class TrayApp : IDisposable
         _link.StateChanged += (s, d) => _ui.Post(_ => ShowState(s, d), null);
         _link.HostFound += host => _ui.Post(_ => RememberHost(host), null);
         _link.ClipDelivered += _ => _ui.Post(_ => _last.Text = "Last sent: " + DateTime.Now.ToString("HH:mm:ss"), null);
+        // Synchronous, so the tablet is only acknowledged once the clip is on the clipboard.
+        _link.ClipReceived += (type, payload) => _ui.Send(_ =>
+        {
+            _watcher.Write(type, payload);
+            _received.Text = "Last received: " + DateTime.Now.ToString("HH:mm:ss");
+            Log($"received {(type == Proto.TypePng ? "image" : "text")} from tablet, {payload.Length} bytes");
+        }, null);
 
         if (!_settings.FirstRunDone)
         {

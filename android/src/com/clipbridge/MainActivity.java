@@ -23,11 +23,12 @@ import android.widget.TextView;
 import java.util.ArrayList;
 import java.util.List;
 
-/** Shows the pairing code and whether the PC is connected. */
+/** Shows the pairing code, whether the PC is connected, and how to send to it. */
 public class MainActivity extends Activity {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private TextView status;
     private TextView last;
+    private TextView sent;
     private TextView addresses;
     private Button battery;
 
@@ -38,6 +39,7 @@ public class MainActivity extends Activity {
         status.setText(on ? "Connected to your PC" + BridgeService.connectedVia : "Waiting for your PC");
         status.setTextColor(on ? Color.rgb(46, 125, 50) : Color.rgb(198, 120, 0));
         last.setText("Last received: " + BridgeService.lastClip);
+        sent.setText("Last sent: " + BridgeService.lastSent);
         addresses.setText(BridgeService.bluetoothState + "\nThis tablet's address: " + String.join(", ", BridgeService.localAddresses()));
         boolean exempt = getSystemService(PowerManager.class).isIgnoringBatteryOptimizations(getPackageName());
         battery.setVisibility(exempt ? Button.GONE : Button.VISIBLE);
@@ -58,6 +60,20 @@ public class MainActivity extends Activity {
         root.addView(status);
         last = text("", 16, false);
         root.addView(last);
+        sent = text("", 16, false);
+        root.addView(sent);
+
+        Button send = new Button(this);
+        send.setText("Send clipboard to PC");
+        send.setOnClickListener(v -> startActivity(
+                new Intent(this, SendActivity.class).setAction(SendActivity.ACTION_SEND_CLIPBOARD)));
+        root.addView(send);
+
+        TextView how = text("To send to your PC from anywhere, tap Send clipboard to PC in the ClipBridge "
+                + "notification, or add the Send to PC tile to Quick Settings. You can also choose "
+                + "Send to PC when you select text or share a picture.", 14, false);
+        how.setPadding(0, dp(8), 0, 0);
+        root.addView(how);
 
         TextView label = text("Pairing code. Type this into ClipBridge on your PC:", 16, false);
         label.setPadding(0, dp(32), 0, dp(8));

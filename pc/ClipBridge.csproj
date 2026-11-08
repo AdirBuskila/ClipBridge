@@ -7,9 +7,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>ClipBridge</RootNamespace>
     <AssemblyName>ClipBridge</AssemblyName>
-    <Version>1.2.0</Version>
+    <Version>1.3.0</Version>
     <Product>ClipBridge</Product>
-    <Description>Copy on your Windows PC, paste on your Android device.</Description>
+    <Description>Share the clipboard between your Windows PC and your Android device.</Description>
     <DebugType>none</DebugType>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <DefaultItemExcludes>$(DefaultItemExcludes);Tests\**</DefaultItemExcludes>

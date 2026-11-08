@@ -6,7 +6,11 @@ using ClipBridge.Core;
 
 namespace ClipBridge;
 
-/// <summary>Raises Copied whenever text or an image lands on the Windows clipboard.</summary>
+/// <summary>
+/// Raises Copied whenever text or an image lands on the Windows clipboard, and puts
+/// clips from the tablet there. Its own writes don't raise Copied, so a clip from the
+/// tablet isn't sent straight back.
+/// </summary>
 internal sealed class ClipboardWatcher : NativeWindow, IDisposable
 {
     private const int WM_CLIPBOARDUPDATE = 0x031D;
@@ -17,12 +21,16 @@ internal sealed class ClipboardWatcher : NativeWindow, IDisposable
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool RemoveClipboardFormatListener(IntPtr hwnd);
 
+    [DllImport("user32.dll")]
+    private static extern uint GetClipboardSequenceNumber();
+
     public event Action<byte, byte[]>? Copied;
     public event Action<string>? Log;
 
     private readonly System.Windows.Forms.Timer _settle = new() { Interval = 120 };
     private string? _lastHash;
     private long _lastHashAt;
+    private uint _ownSequence;
 
     public ClipboardWatcher()
     {
@@ -73,6 +81,10 @@ internal sealed class ClipboardWatcher : NativeWindow, IDisposable
 
     private void ReadOnce()
     {
+        // Windows bumps this number on every change, so it still matching means
+        // nothing was copied since Write put the tablet's clip there.
+        if (_ownSequence != 0 && GetClipboardSequenceNumber() == _ownSequence) return;
+
         var data = Clipboard.GetDataObject();
         if (data == null) return;
 
@@ -131,6 +143,47 @@ internal sealed class ClipboardWatcher : NativeWindow, IDisposable
 
         Copied?.Invoke(type, payload);
     }
+
+    /// <summary>Puts a clip from the tablet on the clipboard. Call on the UI thread.</summary>
+    public void Write(byte type, byte[] payload)
+    {
+        var data = new DataObject();
+        Bitmap? bitmap = null;
+        if (type == Proto.TypeText)
+        {
+            data.SetText(Encoding.UTF8.GetString(payload), TextDataFormat.UnicodeText);
+        }
+        else if (type == Proto.TypePng)
+        {
+            // The tablet sends PNG, or the original JPEG, GIF or BMP of a shared photo.
+            using (var ms = new MemoryStream(payload))
+            using (var image = Image.FromStream(ms))
+            {
+                bitmap = new Bitmap(image);
+            }
+            data.SetImage(bitmap);
+            // Apps that understand PNG keep its transparency.
+            if (IsPng(payload)) data.SetData("PNG", false, new MemoryStream(payload));
+        }
+        else
+        {
+            throw new ArgumentException($"unknown clip type {type}");
+        }
+
+        try
+        {
+            // Retries for a few seconds if another app has the clipboard open.
+            Clipboard.SetDataObject(data, true, 20, 100);
+            _ownSequence = GetClipboardSequenceNumber();
+        }
+        finally
+        {
+            bitmap?.Dispose();
+        }
+    }
+
+    private static bool IsPng(byte[] b) =>
+        b.Length > 8 && b[0] == 0x89 && b[1] == (byte)'P' && b[2] == (byte)'N' && b[3] == (byte)'G';
 
     public void Dispose()
     {

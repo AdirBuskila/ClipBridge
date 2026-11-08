@@ -34,6 +34,9 @@ public final class Protocol {
 
     public static final int MAX_FRAME = 128 * 1024 * 1024;
 
+    /** Appended to the PC's pings when it can read clips the tablet sends. */
+    static final byte[] DUPLEX_MARKER = ascii("CB-DUPLEX");
+
     static final byte[] HELLO = ascii("CB1\n");
     static final byte[] DISCOVER_MAGIC = ascii("CBD1");
     static final byte[] REPLY_MAGIC = ascii("CBR1");
